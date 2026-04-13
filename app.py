@@ -31,6 +31,17 @@ FFMPEG_PATH     = imageio_ffmpeg.get_ffmpeg_exe()
 log.info(f"ffmpeg path resolved to: {FFMPEG_PATH}")
 log.info(f"PUBLIC_URL: {PUBLIC_URL}")
 
+# Write YouTube cookies from env var to a file for yt-dlp to use
+COOKIES_PATH = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+youtube_cookies = os.environ.get('YOUTUBE_COOKIES', '')
+if youtube_cookies:
+    with open(COOKIES_PATH, 'w') as f:
+        f.write(youtube_cookies)
+    log.info(f"YouTube cookies written to: {COOKIES_PATH}")
+else:
+    COOKIES_PATH = None
+    log.warning("No YOUTUBE_COOKIES env var found — downloads may fail with 429")
+
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 youtube       = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
 
@@ -63,9 +74,9 @@ def format_duration(iso_duration):
     match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_duration)
     if not match:
         return '?:??'
-    hours   = int(match.group(1) or 0)
-    minutes = int(match.group(2) or 0)
-    seconds = int(match.group(3) or 0)
+    hours        = int(match.group(1) or 0)
+    minutes      = int(match.group(2) or 0)
+    seconds      = int(match.group(3) or 0)
     total_minutes = hours * 60 + minutes
     return f"{total_minutes}:{seconds:02d}"
 
@@ -141,24 +152,26 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
     try:
         output_template = os.path.join(job_dir, '%(title)s.%(ext)s')
 
-        result = subprocess.run(
-            [
-                'yt-dlp',
-                youtube_url,
-                '--extract-audio',
-                '--audio-format', 'mp3',
-                '--audio-quality', '0',
-                '--output', output_template,
-                '--no-playlist',
-                '--ffmpeg-location', FFMPEG_PATH,
-                # Bypass bot detection by using the Android client
-                '--extractor-args', 'youtube:player_client=android,web',
-                '--quiet'
-            ],
-            capture_output=True,
-            text=True,
-            timeout=180
-        )
+        cmd = [
+            'yt-dlp',
+            youtube_url,
+            '--extract-audio',
+            '--audio-format', 'mp3',
+            '--audio-quality', '0',
+            '--output', output_template,
+            '--no-playlist',
+            '--ffmpeg-location', FFMPEG_PATH,
+            '--extractor-args', 'youtube:player_client=android,web',
+            '--quiet'
+        ]
+
+        if COOKIES_PATH and os.path.exists(COOKIES_PATH):
+            cmd += ['--cookies', COOKIES_PATH]
+            log.debug(f"[DOWNLOAD] Using cookies from: {COOKIES_PATH}")
+        else:
+            log.warning("[DOWNLOAD] No cookies file — attempting download without authentication")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
 
         log.debug(f"[DOWNLOAD] yt-dlp return code: {result.returncode}")
         if result.stderr:
@@ -242,6 +255,7 @@ def webhook():
     if not body or not from_number:
         return '', 200
 
+    # ── Cancel ──────────────────────────────────────────────────────────────
     if body.lower() == 'cancel':
         if from_number in user_sessions:
             del user_sessions[from_number]
@@ -252,6 +266,7 @@ def webhook():
                 "Nothing to cancel! Send a song name to search.")
         return '', 200
 
+    # ── Direct YouTube URL ───────────────────────────────────────────────────
     if 'youtube.com/watch' in body or 'youtu.be/' in body:
         user_sessions.pop(from_number, None)
         send_message(from_number, to_number,
@@ -263,6 +278,7 @@ def webhook():
         ).start()
         return '', 200
 
+    # ── Number selection from previous search ────────────────────────────────
     if from_number in user_sessions and body in ('1', '2', '3', '4', '5'):
         idx     = int(body) - 1
         options = user_sessions[from_number]
@@ -286,6 +302,7 @@ def webhook():
 
         return '', 200
 
+    # ── New song search ──────────────────────────────────────────────────────
     user_sessions.pop(from_number, None)
     handle_new_search(body, from_number, to_number)
     return '', 200
