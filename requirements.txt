@@ -1,4 +1,3 @@
 flask
 twilio
-spotdl
-spotipy
+yt-dlp
