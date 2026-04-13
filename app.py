@@ -4,12 +4,18 @@ import json
 import subprocess
 import threading
 import shutil
+import logging
 from urllib.parse import quote
 from flask import Flask, request, send_from_directory
 from twilio.rest import Client
-
 import imageio_ffmpeg
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -18,13 +24,16 @@ app = Flask(__name__)
 TWILIO_SID   = os.environ['TWILIO_ACCOUNT_SID']
 TWILIO_TOKEN = os.environ['TWILIO_AUTH_TOKEN']
 PUBLIC_URL   = os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
+FFMPEG_PATH  = imageio_ffmpeg.get_ffmpeg_exe()
+
+log.info(f"ffmpeg path resolved to: {FFMPEG_PATH}")
+log.info(f"PUBLIC_URL: {PUBLIC_URL}")
 
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), 'downloads')
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Stores pending search results per user: { phone_number: [result_dict, ...] }
 user_sessions = {}
 
 # ── File serving ──────────────────────────────────────────────────────────────
@@ -37,7 +46,6 @@ def serve_file(job_id, filename):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def send_message(to, from_, body, media_url=None):
-    """Send a WhatsApp message, optionally with a media attachment."""
     kwargs = {'from_': from_, 'to': to, 'body': body}
     if media_url:
         kwargs['media_url'] = [media_url]
@@ -45,7 +53,6 @@ def send_message(to, from_, body, media_url=None):
 
 
 def format_duration(seconds):
-    """Convert seconds to mm:ss string."""
     if not seconds:
         return '?:??'
     seconds = int(seconds)
@@ -53,48 +60,76 @@ def format_duration(seconds):
 
 
 def search_youtube(query):
-    """
-    Use yt-dlp to search YouTube and return the top 5 results
-    without downloading anything.
-    """
-    result = subprocess.run(
-        [
-            'yt-dlp',
-            f'ytsearch5:{query}',
-            '--dump-json',
-            '--no-download',
-            '--no-playlist',
-            '--ffmpeg-location', FFMPEG_PATH,
-            '--quiet'
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30
-    )
+    log.info(f"[SEARCH] Starting search for query: '{query}'")
+    log.debug(f"[SEARCH] Using ffmpeg at: {FFMPEG_PATH}")
+
+    cmd = [
+        'yt-dlp',
+        f'ytsearch5:{query}',
+        '--dump-json',
+        '--no-download',
+        '--no-playlist',
+        '--ffmpeg-location', FFMPEG_PATH,
+        '--quiet'
+    ]
+    log.debug(f"[SEARCH] Running command: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        log.error("[SEARCH] yt-dlp search timed out after 30 seconds")
+        raise Exception("yt-dlp search timed out after 30 seconds")
+    except FileNotFoundError:
+        log.error("[SEARCH] yt-dlp binary not found — is it installed?")
+        raise Exception("yt-dlp not found. Check that it is installed in requirements.txt")
+
+    log.debug(f"[SEARCH] yt-dlp return code: {result.returncode}")
+
+    if result.stdout:
+        log.debug(f"[SEARCH] yt-dlp stdout (first 500 chars): {result.stdout[:500]}")
+    else:
+        log.warning("[SEARCH] yt-dlp stdout is empty")
+
+    if result.stderr:
+        log.warning(f"[SEARCH] yt-dlp stderr: {result.stderr[:500]}")
 
     if result.returncode != 0:
-        raise Exception(f"yt-dlp search error: {result.stderr}")
+        log.error(f"[SEARCH] yt-dlp exited with non-zero code {result.returncode}")
+        raise Exception(f"yt-dlp search error (code {result.returncode}): {result.stderr}")
+
+    lines = result.stdout.strip().splitlines()
+    log.info(f"[SEARCH] yt-dlp returned {len(lines)} line(s) of JSON")
 
     results = []
-    for line in result.stdout.strip().splitlines():
+    for i, line in enumerate(lines):
         if not line.strip():
+            log.debug(f"[SEARCH] Line {i} is blank, skipping")
             continue
         try:
             info = json.loads(line)
-            results.append({
+            entry = {
                 'title':    info.get('title', 'Unknown Title'),
                 'uploader': info.get('uploader', 'Unknown Artist'),
                 'duration': format_duration(info.get('duration')),
                 'url':      info.get('webpage_url') or info.get('url', ''),
-            })
-        except json.JSONDecodeError:
+            }
+            log.debug(f"[SEARCH] Result {i+1}: {entry['title']} — {entry['uploader']} ({entry['duration']}) → {entry['url']}")
+            results.append(entry)
+        except json.JSONDecodeError as e:
+            log.error(f"[SEARCH] Failed to parse JSON on line {i}: {e}")
+            log.debug(f"[SEARCH] Raw line content: {line[:300]}")
             continue
 
+    log.info(f"[SEARCH] Successfully parsed {len(results)} result(s)")
     return results
 
 
 def download_and_send(youtube_url, title, uploader, from_number, to_number):
-    """Download a YouTube video as MP3 and send it back to the user."""
     job_id  = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -134,7 +169,6 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
             media_url=file_url
         )
 
-        # Clean up job folder after 5 minutes
         def cleanup():
             import time
             time.sleep(300)
@@ -144,7 +178,7 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
         threading.Thread(target=cleanup, daemon=True).start()
 
     except Exception as e:
-        print(f"[ERROR] Download failed for {youtube_url}: {e}")
+        log.error(f"[DOWNLOAD] Failed for {youtube_url}: {e}")
         if os.path.exists(job_dir):
             shutil.rmtree(job_dir)
         send_message(
@@ -155,11 +189,12 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
 
 
 def handle_new_search(query, from_number, to_number):
-    """Search YouTube and present the top 5 results to the user."""
+    log.info(f"[HANDLER] handle_new_search called — query='{query}' from={from_number}")
     try:
         results = search_youtube(query)
 
         if not results:
+            log.warning(f"[HANDLER] Search returned 0 results for '{query}'")
             send_message(
                 from_number, to_number,
                 f'❌ No results found for "{query}". Please try a different search.'
@@ -167,6 +202,7 @@ def handle_new_search(query, from_number, to_number):
             return
 
         user_sessions[from_number] = results
+        log.info(f"[HANDLER] Session saved for {from_number} with {len(results)} result(s)")
 
         lines = [f'🔍 Top YouTube results for "{query}":\n']
         for i, r in enumerate(results, 1):
@@ -174,9 +210,10 @@ def handle_new_search(query, from_number, to_number):
         lines.append('\nReply with a number (1–5) to download, or send a new song name to search again.')
 
         send_message(from_number, to_number, '\n'.join(lines))
+        log.info(f"[HANDLER] Results message sent to {from_number}")
 
     except Exception as e:
-        print(f"[ERROR] Search failed for '{query}': {e}")
+        log.error(f"[HANDLER] Search failed for '{query}': {e}", exc_info=True)
         send_message(from_number, to_number,
             "❌ Search failed. Please try again in a moment.")
 
@@ -189,10 +226,11 @@ def webhook():
     to_number   = request.form.get('To', '').strip()
     body        = request.form.get('Body', '').strip()
 
+    log.info(f"[WEBHOOK] Incoming message from={from_number} body='{body}'")
+
     if not body or not from_number:
         return '', 200
 
-    # ── Cancel ──────────────────────────────────────────────────────────────
     if body.lower() == 'cancel':
         if from_number in user_sessions:
             del user_sessions[from_number]
@@ -203,7 +241,6 @@ def webhook():
                 "Nothing to cancel! Send a song name to search.")
         return '', 200
 
-    # ── Direct YouTube URL ───────────────────────────────────────────────────
     if 'youtube.com/watch' in body or 'youtu.be/' in body:
         user_sessions.pop(from_number, None)
         send_message(from_number, to_number,
@@ -215,7 +252,6 @@ def webhook():
         ).start()
         return '', 200
 
-    # ── Number selection from previous search ────────────────────────────────
     if from_number in user_sessions and body in ('1', '2', '3', '4', '5'):
         idx     = int(body) - 1
         options = user_sessions[from_number]
@@ -239,8 +275,6 @@ def webhook():
 
         return '', 200
 
-    # ── New song search ──────────────────────────────────────────────────────
-    # Also clears any stale session so typing a new song always restarts
     user_sessions.pop(from_number, None)
     handle_new_search(body, from_number, to_number)
     return '', 200
