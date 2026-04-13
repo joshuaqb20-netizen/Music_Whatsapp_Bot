@@ -1,46 +1,27 @@
 import os
 import uuid
+import json
 import subprocess
 import threading
 import shutil
 from urllib.parse import quote
 from flask import Flask, request, send_from_directory
 from twilio.rest import Client
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
 
 app = Flask(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TWILIO_SID            = os.environ['TWILIO_ACCOUNT_SID']
-TWILIO_TOKEN          = os.environ['TWILIO_AUTH_TOKEN']
-PUBLIC_URL            = os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
-SPOTIFY_CLIENT_ID     = os.environ['SPOTIFY_CLIENT_ID']
-SPOTIFY_CLIENT_SECRET = os.environ['SPOTIFY_CLIENT_SECRET']
+TWILIO_SID   = os.environ['TWILIO_ACCOUNT_SID']
+TWILIO_TOKEN = os.environ['TWILIO_AUTH_TOKEN']
+PUBLIC_URL   = os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
 
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
-
-# ✅ UPDATED Spotify init with error handling + test
-try:
-    auth_manager = SpotifyClientCredentials(
-        client_id=SPOTIFY_CLIENT_ID,
-        client_secret=SPOTIFY_CLIENT_SECRET
-    )
-    sp = spotipy.Spotify(auth_manager=auth_manager)
-
-    # 🔥 Force test call
-    sp.search(q="test", type="track", limit=1)
-    print("✅ Spotify auth working")
-
-except Exception as e:
-    print("❌ Spotify INIT FAILED:", e)
-    sp = None
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), 'downloads')
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Stores pending search results per user: { phone_number: [track_dict, ...] }
+# Stores pending search results per user: { phone_number: [result_dict, ...] }
 user_sessions = {}
 
 # ── File serving ──────────────────────────────────────────────────────────────
@@ -53,77 +34,102 @@ def serve_file(job_id, filename):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def send_message(to, from_, body, media_url=None):
-    """Send a WhatsApp message, optionally with a media file."""
+    """Send a WhatsApp message, optionally with a media attachment."""
     kwargs = {'from_': from_, 'to': to, 'body': body}
     if media_url:
         kwargs['media_url'] = [media_url]
     twilio_client.messages.create(**kwargs)
 
 
-def search_spotify(query):
-    # ✅ Added safety check
-    if not sp:
-        raise Exception("Spotify not initialized")
-
-    """Search Spotify and return up to 5 track results."""
-    results = sp.search(q=query, type='track', limit=5)
-    tracks = results['tracks']['items']
-    options = []
-    for track in tracks:
-        name    = track['name']
-        artists = ', '.join(a['name'] for a in track['artists'])
-        url     = track['external_urls']['spotify']
-        ms      = track['duration_ms']
-        duration = f"{ms // 60000}:{(ms % 60000) // 1000:02d}"
-        options.append({
-            'name': name,
-            'artists': artists,
-            'url': url,
-            'duration': duration
-        })
-    return options
+def format_duration(seconds):
+    """Convert seconds to mm:ss string."""
+    if not seconds:
+        return '?:??'
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def download_and_send(spotify_url, track_name, artists, from_number, to_number):
-    """Download a song via spotdl and send it back to the user."""
+def search_youtube(query):
+    """
+    Use yt-dlp to search YouTube and return the top 5 results
+    without downloading anything.
+    """
+    result = subprocess.run(
+        [
+            'yt-dlp',
+            f'ytsearch5:{query}',
+            '--dump-json',
+            '--no-download',
+            '--no-playlist',
+            '--quiet'
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30
+    )
+
+    if result.returncode != 0:
+        raise Exception(f"yt-dlp search error: {result.stderr}")
+
+    results = []
+    for line in result.stdout.strip().splitlines():
+        if not line.strip():
+            continue
+        try:
+            info = json.loads(line)
+            results.append({
+                'title':    info.get('title', 'Unknown Title'),
+                'uploader': info.get('uploader', 'Unknown Artist'),
+                'duration': format_duration(info.get('duration')),
+                'url':      info.get('webpage_url') or info.get('url', ''),
+            })
+        except json.JSONDecodeError:
+            continue
+
+    return results
+
+
+def download_and_send(youtube_url, title, uploader, from_number, to_number):
+    """Download a YouTube video as MP3 and send it back to the user."""
     job_id  = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        output_template = os.path.join(job_dir, '{artists} - {title}.mp3')
+        output_template = os.path.join(job_dir, '%(title)s.%(ext)s')
 
         result = subprocess.run(
             [
-                'spotdl', spotify_url,
+                'yt-dlp',
+                youtube_url,
+                '--extract-audio',
+                '--audio-format', 'mp3',
+                '--audio-quality', '0',
                 '--output', output_template,
-                '--format', 'mp3'
+                '--no-playlist',
+                '--quiet'
             ],
             capture_output=True,
             text=True,
-            timeout=300  # ✅ increased timeout
+            timeout=180
         )
-
-        # ✅ Added debug logs
-        print("SPOTDL STDOUT:", result.stdout)
-        print("SPOTDL STDERR:", result.stderr)
 
         mp3_files = [f for f in os.listdir(job_dir) if f.endswith('.mp3')]
 
         if not mp3_files:
             error_detail = result.stderr or result.stdout or 'Unknown error'
-            raise Exception(f"No MP3 created. spotdl said: {error_detail}")
+            raise Exception(f"No MP3 created. yt-dlp said: {error_detail}")
 
         filename = mp3_files[0]
         file_url = f"{PUBLIC_URL}/files/{job_id}/{quote(filename)}"
 
         send_message(
             from_number, to_number,
-            f"✅ Here's *{track_name}* by *{artists}*!",
+            f"✅ Here's *{title}* by *{uploader}*!",
             media_url=file_url
         )
 
-        # Clean up the job folder after 5 minutes
+        # Clean up job folder after 5 minutes
         def cleanup():
             import time
             time.sleep(300)
@@ -133,42 +139,42 @@ def download_and_send(spotify_url, track_name, artists, from_number, to_number):
         threading.Thread(target=cleanup, daemon=True).start()
 
     except Exception as e:
-        print(f"[ERROR] Download failed for {spotify_url}: {e}")
+        print(f"[ERROR] Download failed for {youtube_url}: {e}")
         if os.path.exists(job_dir):
             shutil.rmtree(job_dir)
         send_message(
             from_number, to_number,
-            f"❌ Download failed: {str(e)}"  # ✅ improved error message
+            "❌ Download failed. The video may be unavailable or too large. "
+            "Try a different result or search again."
         )
 
 
 def handle_new_search(query, from_number, to_number):
-    """Search Spotify and present the top 5 results to the user."""
+    """Search YouTube and present the top 5 results to the user."""
     try:
-        options = search_spotify(query)
+        results = search_youtube(query)
 
-        if not options:
+        if not results:
             send_message(
                 from_number, to_number,
                 f'❌ No results found for "{query}". Please try a different search.'
             )
             return
 
-        user_sessions[from_number] = options
+        user_sessions[from_number] = results
 
-        lines = [f'🔍 Top results for "{query}":\n']
-        for i, opt in enumerate(options, 1):
-            lines.append(f"{i}. {opt['name']} — {opt['artists']} ({opt['duration']})")
-        lines.append('\nReply with a number to download, or send a new song name to search again.')
+        lines = [f'🔍 Top YouTube results for "{query}":\n']
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. {r['title']} — {r['uploader']} ({r['duration']})")
+        lines.append('\nReply with a number (1–5) to download, or send a new song name to search again.')
 
         send_message(from_number, to_number, '\n'.join(lines))
 
     except Exception as e:
-        print(f"[ERROR] Search failed for '{query}': {repr(e)}")  # ✅ better logging
-        send_message(
-            from_number, to_number,
-            f"❌ Search failed: {str(e)}"  # ✅ improved error message
-        )
+        print(f"[ERROR] Search failed for '{query}': {e}")
+        send_message(from_number, to_number,
+            "❌ Search failed. Please try again in a moment.")
+
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
@@ -181,7 +187,7 @@ def webhook():
     if not body or not from_number:
         return '', 200
 
-    # ── Cancel ──
+    # ── Cancel ──────────────────────────────────────────────────────────────
     if body.lower() == 'cancel':
         if from_number in user_sessions:
             del user_sessions[from_number]
@@ -192,33 +198,19 @@ def webhook():
                 "Nothing to cancel! Send a song name to search.")
         return '', 200
 
-    # ── Direct Spotify URL ──
-    if body.startswith('https://open.spotify.com/track/'):
-        try:
-            track_id   = body.split('/track/')[1].split('?')[0]
-            track      = sp.track(track_id)
-            track_name = track['name']
-            artists    = ', '.join(a['name'] for a in track['artists'])
-
-            # Clear any pending session
-            user_sessions.pop(from_number, None)
-
-            send_message(from_number, to_number,
-                f"⬇️ Downloading *{track_name}* by *{artists}*...")
-
-            threading.Thread(
-                target=download_and_send,
-                args=(body, track_name, artists, from_number, to_number),
-                daemon=True
-            ).start()
-
-        except Exception as e:
-            print(f"[ERROR] Spotify URL lookup failed: {e}")
-            send_message(from_number, to_number,
-                "❌ Couldn't read that Spotify link. Try searching by song name instead.")
+    # ── Direct YouTube URL ───────────────────────────────────────────────────
+    if 'youtube.com/watch' in body or 'youtu.be/' in body:
+        user_sessions.pop(from_number, None)
+        send_message(from_number, to_number,
+            "⬇️ Got your YouTube link! Downloading now, please wait...")
+        threading.Thread(
+            target=download_and_send,
+            args=(body, 'your song', 'YouTube', from_number, to_number),
+            daemon=True
+        ).start()
         return '', 200
 
-    # ── Selection from previous search ──
+    # ── Number selection from previous search ────────────────────────────────
     if from_number in user_sessions and body in ('1', '2', '3', '4', '5'):
         idx     = int(body) - 1
         options = user_sessions[from_number]
@@ -232,26 +224,29 @@ def webhook():
         del user_sessions[from_number]
 
         send_message(from_number, to_number,
-            f"⬇️ Downloading *{chosen['name']}* by *{chosen['artists']}*...")
+            f"⬇️ Downloading *{chosen['title']}* by *{chosen['uploader']}*...")
 
         threading.Thread(
             target=download_and_send,
-            args=(chosen['url'], chosen['name'], chosen['artists'], from_number, to_number),
+            args=(chosen['url'], chosen['title'], chosen['uploader'], from_number, to_number),
             daemon=True
         ).start()
 
         return '', 200
 
-    # ── New song search (also clears any stale session) ──
+    # ── New song search ──────────────────────────────────────────────────────
+    # Also clears any stale session so typing a new song always restarts
     user_sessions.pop(from_number, None)
     handle_new_search(body, from_number, to_number)
     return '', 200
+
 
 # ── Health check ──────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
     return '🎵 Bot is running!'
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
