@@ -9,6 +9,7 @@ from urllib.parse import quote
 from flask import Flask, request, send_from_directory
 from twilio.rest import Client
 import imageio_ffmpeg
+from googleapiclient.discovery import build
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -21,15 +22,17 @@ app = Flask(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TWILIO_SID   = os.environ['TWILIO_ACCOUNT_SID']
-TWILIO_TOKEN = os.environ['TWILIO_AUTH_TOKEN']
-PUBLIC_URL   = os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
-FFMPEG_PATH  = imageio_ffmpeg.get_ffmpeg_exe()
+TWILIO_SID      = os.environ['TWILIO_ACCOUNT_SID']
+TWILIO_TOKEN    = os.environ['TWILIO_AUTH_TOKEN']
+PUBLIC_URL      = os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
+YOUTUBE_API_KEY = os.environ['YOUTUBE_API_KEY']
+FFMPEG_PATH     = imageio_ffmpeg.get_ffmpeg_exe()
 
 log.info(f"ffmpeg path resolved to: {FFMPEG_PATH}")
 log.info(f"PUBLIC_URL: {PUBLIC_URL}")
 
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
+youtube       = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), 'downloads')
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -52,87 +55,88 @@ def send_message(to, from_, body, media_url=None):
     twilio_client.messages.create(**kwargs)
 
 
-def format_duration(seconds):
-    if not seconds:
+def format_duration(iso_duration):
+    """Convert ISO 8601 duration (PT4M13S) to mm:ss string."""
+    import re
+    if not iso_duration:
         return '?:??'
-    seconds = int(seconds)
-    return f"{seconds // 60}:{seconds % 60:02d}"
+    match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_duration)
+    if not match:
+        return '?:??'
+    hours   = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    total_minutes = hours * 60 + minutes
+    return f"{total_minutes}:{seconds:02d}"
 
 
 def search_youtube(query):
-    log.info(f"[SEARCH] Starting search for query: '{query}'")
-    log.debug(f"[SEARCH] Using ffmpeg at: {FFMPEG_PATH}")
+    """
+    Search YouTube using the Data API v3 — no bot detection, no JS runtime needed.
+    Returns up to 5 results with title, channel, duration and URL.
+    """
+    log.info(f"[SEARCH] Starting YouTube API search for: '{query}'")
 
-    cmd = [
-        'yt-dlp',
-        f'ytsearch5:{query}',
-        '--dump-json',
-        '--no-download',
-        '--no-playlist',
-        '--ffmpeg-location', FFMPEG_PATH,
-        '--quiet'
-    ]
-    log.debug(f"[SEARCH] Running command: {' '.join(cmd)}")
+    # Step 1: search for video IDs
+    search_response = youtube.search().list(
+        q=query,
+        part='id,snippet',
+        maxResults=5,
+        type='video'
+    ).execute()
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-    except subprocess.TimeoutExpired:
-        log.error("[SEARCH] yt-dlp search timed out after 30 seconds")
-        raise Exception("yt-dlp search timed out after 30 seconds")
-    except FileNotFoundError:
-        log.error("[SEARCH] yt-dlp binary not found — is it installed?")
-        raise Exception("yt-dlp not found. Check that it is installed in requirements.txt")
+    items = search_response.get('items', [])
+    log.info(f"[SEARCH] YouTube API returned {len(items)} item(s)")
 
-    log.debug(f"[SEARCH] yt-dlp return code: {result.returncode}")
+    if not items:
+        return []
 
-    if result.stdout:
-        log.debug(f"[SEARCH] yt-dlp stdout (first 500 chars): {result.stdout[:500]}")
-    else:
-        log.warning("[SEARCH] yt-dlp stdout is empty")
+    video_ids = [item['id']['videoId'] for item in items]
+    log.debug(f"[SEARCH] Video IDs: {video_ids}")
 
-    if result.stderr:
-        log.warning(f"[SEARCH] yt-dlp stderr: {result.stderr[:500]}")
+    # Step 2: fetch durations for those video IDs
+    details_response = youtube.videos().list(
+        id=','.join(video_ids),
+        part='contentDetails,snippet'
+    ).execute()
 
-    if result.returncode != 0:
-        log.error(f"[SEARCH] yt-dlp exited with non-zero code {result.returncode}")
-        raise Exception(f"yt-dlp search error (code {result.returncode}): {result.stderr}")
+    details_map = {}
+    for video in details_response.get('items', []):
+        vid_id = video['id']
+        details_map[vid_id] = {
+            'duration': format_duration(video['contentDetails']['duration']),
+            'channel':  video['snippet']['channelTitle']
+        }
 
-    lines = result.stdout.strip().splitlines()
-    log.info(f"[SEARCH] yt-dlp returned {len(lines)} line(s) of JSON")
-
+    # Step 3: assemble results
     results = []
-    for i, line in enumerate(lines):
-        if not line.strip():
-            log.debug(f"[SEARCH] Line {i} is blank, skipping")
-            continue
-        try:
-            info = json.loads(line)
-            entry = {
-                'title':    info.get('title', 'Unknown Title'),
-                'uploader': info.get('uploader', 'Unknown Artist'),
-                'duration': format_duration(info.get('duration')),
-                'url':      info.get('webpage_url') or info.get('url', ''),
-            }
-            log.debug(f"[SEARCH] Result {i+1}: {entry['title']} — {entry['uploader']} ({entry['duration']}) → {entry['url']}")
-            results.append(entry)
-        except json.JSONDecodeError as e:
-            log.error(f"[SEARCH] Failed to parse JSON on line {i}: {e}")
-            log.debug(f"[SEARCH] Raw line content: {line[:300]}")
-            continue
+    for item in items:
+        vid_id   = item['id']['videoId']
+        title    = item['snippet']['title']
+        details  = details_map.get(vid_id, {})
+        channel  = details.get('channel', item['snippet']['channelTitle'])
+        duration = details.get('duration', '?:??')
+        url      = f"https://www.youtube.com/watch?v={vid_id}"
 
-    log.info(f"[SEARCH] Successfully parsed {len(results)} result(s)")
+        log.debug(f"[SEARCH] Result: {title} — {channel} ({duration}) → {url}")
+        results.append({
+            'title':    title,
+            'uploader': channel,
+            'duration': duration,
+            'url':      url,
+        })
+
+    log.info(f"[SEARCH] Successfully built {len(results)} result(s)")
     return results
 
 
 def download_and_send(youtube_url, title, uploader, from_number, to_number):
+    """Download a YouTube video as MP3 and send it back to the user."""
     job_id  = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
+
+    log.info(f"[DOWNLOAD] Starting download: {youtube_url}")
 
     try:
         output_template = os.path.join(job_dir, '%(title)s.%(ext)s')
@@ -147,12 +151,18 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
                 '--output', output_template,
                 '--no-playlist',
                 '--ffmpeg-location', FFMPEG_PATH,
+                # Bypass bot detection by using the Android client
+                '--extractor-args', 'youtube:player_client=android,web',
                 '--quiet'
             ],
             capture_output=True,
             text=True,
             timeout=180
         )
+
+        log.debug(f"[DOWNLOAD] yt-dlp return code: {result.returncode}")
+        if result.stderr:
+            log.warning(f"[DOWNLOAD] yt-dlp stderr: {result.stderr[:500]}")
 
         mp3_files = [f for f in os.listdir(job_dir) if f.endswith('.mp3')]
 
@@ -162,6 +172,7 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
 
         filename = mp3_files[0]
         file_url = f"{PUBLIC_URL}/files/{job_id}/{quote(filename)}"
+        log.info(f"[DOWNLOAD] File ready at: {file_url}")
 
         send_message(
             from_number, to_number,
@@ -178,7 +189,7 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
         threading.Thread(target=cleanup, daemon=True).start()
 
     except Exception as e:
-        log.error(f"[DOWNLOAD] Failed for {youtube_url}: {e}")
+        log.error(f"[DOWNLOAD] Failed for {youtube_url}: {e}", exc_info=True)
         if os.path.exists(job_dir):
             shutil.rmtree(job_dir)
         send_message(
