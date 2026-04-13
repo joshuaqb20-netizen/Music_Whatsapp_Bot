@@ -161,6 +161,7 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
             '--output', output_template,
             '--no-playlist',
             '--ffmpeg-location', FFMPEG_PATH,
+            '--extractor-args', 'youtube:player_client=tv,web',
             '--js-runtimes', 'node',
             '--quiet'
         ]
