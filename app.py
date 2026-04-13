@@ -8,6 +8,9 @@ from urllib.parse import quote
 from flask import Flask, request, send_from_directory
 from twilio.rest import Client
 
+import imageio_ffmpeg
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
 app = Flask(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -61,6 +64,7 @@ def search_youtube(query):
             '--dump-json',
             '--no-download',
             '--no-playlist',
+            '--ffmpeg-location', FFMPEG_PATH,
             '--quiet'
         ],
         capture_output=True,
@@ -107,6 +111,7 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
                 '--audio-quality', '0',
                 '--output', output_template,
                 '--no-playlist',
+                '--ffmpeg-location', FFMPEG_PATH,
                 '--quiet'
             ],
             capture_output=True,
