@@ -1,6 +1,5 @@
 import os
 import uuid
-import json
 import subprocess
 import threading
 import shutil
@@ -74,21 +73,20 @@ def format_duration(iso_duration):
     match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_duration)
     if not match:
         return '?:??'
-    hours        = int(match.group(1) or 0)
-    minutes      = int(match.group(2) or 0)
-    seconds      = int(match.group(3) or 0)
+    hours         = int(match.group(1) or 0)
+    minutes       = int(match.group(2) or 0)
+    seconds       = int(match.group(3) or 0)
     total_minutes = hours * 60 + minutes
     return f"{total_minutes}:{seconds:02d}"
 
 
 def search_youtube(query):
     """
-    Search YouTube using the Data API v3 — no bot detection, no JS runtime needed.
+    Search YouTube using the Data API v3.
     Returns up to 5 results with title, channel, duration and URL.
     """
     log.info(f"[SEARCH] Starting YouTube API search for: '{query}'")
 
-    # Step 1: search for video IDs
     search_response = youtube.search().list(
         q=query,
         part='id,snippet',
@@ -105,7 +103,6 @@ def search_youtube(query):
     video_ids = [item['id']['videoId'] for item in items]
     log.debug(f"[SEARCH] Video IDs: {video_ids}")
 
-    # Step 2: fetch durations for those video IDs
     details_response = youtube.videos().list(
         id=','.join(video_ids),
         part='contentDetails,snippet'
@@ -119,7 +116,6 @@ def search_youtube(query):
             'channel':  video['snippet']['channelTitle']
         }
 
-    # Step 3: assemble results
     results = []
     for item in items:
         vid_id   = item['id']['videoId']
@@ -161,8 +157,6 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
             '--output', output_template,
             '--no-playlist',
             '--ffmpeg-location', FFMPEG_PATH,
-            '--extractor-args', 'youtube:player_client=tv,web',
-            '--js-runtimes', 'node',
             '--quiet'
         ]
 
@@ -170,7 +164,14 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
             cmd += ['--cookies', COOKIES_PATH]
             log.debug(f"[DOWNLOAD] Using cookies from: {COOKIES_PATH}")
         else:
-            log.warning("[DOWNLOAD] No cookies file — attempting download without authentication")
+            log.warning("[DOWNLOAD] No cookies file — attempting without authentication")
+
+        proxy = os.environ.get('YTDLP_PROXY', '')
+        if proxy:
+            cmd += ['--proxy', proxy]
+            log.debug(f"[DOWNLOAD] Using proxy: {proxy}")
+        else:
+            log.warning("[DOWNLOAD] No proxy set — may hit 429 on Render")
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
 
