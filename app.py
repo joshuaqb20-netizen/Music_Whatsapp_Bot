@@ -1,13 +1,12 @@
 import os
 import uuid
-import subprocess
 import threading
 import shutil
 import logging
+import requests
 from urllib.parse import quote
 from flask import Flask, request, send_from_directory
 from twilio.rest import Client
-import imageio_ffmpeg
 from googleapiclient.discovery import build
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -25,21 +24,9 @@ TWILIO_SID      = os.environ['TWILIO_ACCOUNT_SID']
 TWILIO_TOKEN    = os.environ['TWILIO_AUTH_TOKEN']
 PUBLIC_URL      = os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
 YOUTUBE_API_KEY = os.environ['YOUTUBE_API_KEY']
-FFMPEG_PATH     = imageio_ffmpeg.get_ffmpeg_exe()
+RAPIDAPI_KEY    = os.environ['RAPIDAPI_KEY']
 
-log.info(f"ffmpeg path resolved to: {FFMPEG_PATH}")
 log.info(f"PUBLIC_URL: {PUBLIC_URL}")
-
-# Write YouTube cookies from env var to a file for yt-dlp to use
-COOKIES_PATH = os.path.join(os.path.dirname(__file__), 'cookies.txt')
-youtube_cookies = os.environ.get('YOUTUBE_COOKIES', '')
-if youtube_cookies:
-    with open(COOKIES_PATH, 'w') as f:
-        f.write(youtube_cookies)
-    log.info(f"YouTube cookies written to: {COOKIES_PATH}")
-else:
-    COOKIES_PATH = None
-    log.warning("No YOUTUBE_COOKIES env var found — downloads may fail with 429")
 
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 youtube       = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
@@ -66,7 +53,6 @@ def send_message(to, from_, body, media_url=None):
 
 
 def format_duration(iso_duration):
-    """Convert ISO 8601 duration (PT4M13S) to mm:ss string."""
     import re
     if not iso_duration:
         return '?:??'
@@ -81,10 +67,6 @@ def format_duration(iso_duration):
 
 
 def search_youtube(query):
-    """
-    Search YouTube using the Data API v3.
-    Returns up to 5 results with title, channel, duration and URL.
-    """
     log.info(f"[SEARCH] Starting YouTube API search for: '{query}'")
 
     search_response = youtube.search().list(
@@ -101,7 +83,6 @@ def search_youtube(query):
         return []
 
     video_ids = [item['id']['videoId'] for item in items]
-    log.debug(f"[SEARCH] Video IDs: {video_ids}")
 
     details_response = youtube.videos().list(
         id=','.join(video_ids),
@@ -138,56 +119,76 @@ def search_youtube(query):
 
 
 def download_and_send(youtube_url, title, uploader, from_number, to_number):
-    """Download a YouTube video as MP3 and send it back to the user."""
+    import time
+
     job_id  = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    log.info(f"[DOWNLOAD] Starting download: {youtube_url}")
+    log.info(f"[DOWNLOAD] Starting API download for: {youtube_url}")
 
     try:
-        output_template = os.path.join(job_dir, '%(title)s.%(ext)s')
+        # ── Step 1: Call RapidAPI to convert the YouTube URL to an MP3 link ──
+        log.debug("[DOWNLOAD] Calling RapidAPI conversion endpoint...")
 
-        cmd = [
-            'yt-dlp',
-            youtube_url,
-            '--extract-audio',
-            '--audio-format', 'mp3',
-            '--audio-quality', '0',
-            '--output', output_template,
-            '--no-playlist',
-            '--ffmpeg-location', FFMPEG_PATH,
-            '--quiet'
-        ]
+        api_response = requests.get(
+            "https://robotilab.online/download-api/yt/audio?url=https://www.youtube.com/watch?v=phd1U2JIfUA",  # ← CHECK THIS URL matches what you see on the endpoint page
+            headers={
+                "X-RapidAPI-Key":  RAPIDAPI_KEY,
+                "X-RapidAPI-Host": "youtube-mp310.p.rapidapi.com"
+            },
+            params={
+                "url": downloadUrl   # ← CHECK THIS param name matches the endpoint page
+            },
+            timeout=60
+        )
 
-        if COOKIES_PATH and os.path.exists(COOKIES_PATH):
-            cmd += ['--cookies', COOKIES_PATH]
-            log.debug(f"[DOWNLOAD] Using cookies from: {COOKIES_PATH}")
-        else:
-            log.warning("[DOWNLOAD] No cookies file — attempting without authentication")
+        log.debug(f"[DOWNLOAD] RapidAPI status code: {api_response.status_code}")
+        log.debug(f"[DOWNLOAD] RapidAPI raw response: {api_response.text[:500]}")
 
-        proxy = os.environ.get('YTDLP_PROXY', '')
-        if proxy:
-            cmd += ['--proxy', proxy]
-            log.debug(f"[DOWNLOAD] Using proxy: {proxy}")
-        else:
-            log.warning("[DOWNLOAD] No proxy set — may hit 429 on Render")
+        if api_response.status_code != 200:
+            raise Exception(f"RapidAPI returned status {api_response.status_code}: {api_response.text}")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        data = api_response.json()
+        log.debug(f"[DOWNLOAD] RapidAPI parsed response: {data}")
 
-        log.debug(f"[DOWNLOAD] yt-dlp return code: {result.returncode}")
-        if result.stderr:
-            log.warning(f"[DOWNLOAD] yt-dlp stderr: {result.stderr[:500]}")
+        # ── Step 2: Extract the MP3 download link from the response ──
+        # Common field names used by YouTube MP3 APIs — we try them all
+        mp3_url = (
+            data.get('link') or
+            data.get('url') or
+            data.get('download_url') or
+            data.get('mp3') or
+            data.get('downloadUrl')
+        )
 
-        mp3_files = [f for f in os.listdir(job_dir) if f.endswith('.mp3')]
+        if not mp3_url:
+            raise Exception(f"Could not find MP3 link in API response. Full response: {data}")
 
-        if not mp3_files:
-            error_detail = result.stderr or result.stdout or 'Unknown error'
-            raise Exception(f"No MP3 created. yt-dlp said: {error_detail}")
+        log.info(f"[DOWNLOAD] Got MP3 URL from API: {mp3_url[:80]}...")
 
-        filename = mp3_files[0]
-        file_url = f"{PUBLIC_URL}/files/{job_id}/{quote(filename)}"
-        log.info(f"[DOWNLOAD] File ready at: {file_url}")
+        # ── Step 3: Download the MP3 to Render's disk ──
+        filename     = f"{job_id}.mp3"
+        filepath     = os.path.join(job_dir, filename)
+
+        log.debug("[DOWNLOAD] Downloading MP3 file to disk...")
+        mp3_response = requests.get(mp3_url, timeout=120)
+
+        if mp3_response.status_code != 200:
+            raise Exception(f"Failed to download MP3 file: status {mp3_response.status_code}")
+
+        with open(filepath, 'wb') as f:
+            f.write(mp3_response.content)
+
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        log.info(f"[DOWNLOAD] MP3 saved to disk — size: {size_mb:.2f} MB")
+
+        if size_mb > 15:
+            log.warning(f"[DOWNLOAD] File is {size_mb:.2f} MB — may exceed Twilio's 16MB limit")
+
+        # ── Step 4: Serve the file and send it via WhatsApp ──
+        file_url = f"{PUBLIC_URL}/files/{job_id}/{filename}"
+        log.info(f"[DOWNLOAD] Serving file at: {file_url}")
 
         send_message(
             from_number, to_number,
@@ -195,8 +196,8 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
             media_url=file_url
         )
 
+        # Clean up after 5 minutes
         def cleanup():
-            import time
             time.sleep(300)
             if os.path.exists(job_dir):
                 shutil.rmtree(job_dir)
@@ -209,8 +210,7 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
             shutil.rmtree(job_dir)
         send_message(
             from_number, to_number,
-            "❌ Download failed. The video may be unavailable or too large. "
-            "Try a different result or search again."
+            "❌ Download failed. Try a different result or search again."
         )
 
 
@@ -257,7 +257,6 @@ def webhook():
     if not body or not from_number:
         return '', 200
 
-    # ── Cancel ──────────────────────────────────────────────────────────────
     if body.lower() == 'cancel':
         if from_number in user_sessions:
             del user_sessions[from_number]
@@ -268,7 +267,6 @@ def webhook():
                 "Nothing to cancel! Send a song name to search.")
         return '', 200
 
-    # ── Direct YouTube URL ───────────────────────────────────────────────────
     if 'youtube.com/watch' in body or 'youtu.be/' in body:
         user_sessions.pop(from_number, None)
         send_message(from_number, to_number,
@@ -280,7 +278,6 @@ def webhook():
         ).start()
         return '', 200
 
-    # ── Number selection from previous search ────────────────────────────────
     if from_number in user_sessions and body in ('1', '2', '3', '4', '5'):
         idx     = int(body) - 1
         options = user_sessions[from_number]
@@ -304,7 +301,6 @@ def webhook():
 
         return '', 200
 
-    # ── New song search ──────────────────────────────────────────────────────
     user_sessions.pop(from_number, None)
     handle_new_search(body, from_number, to_number)
     return '', 200
