@@ -132,13 +132,13 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
         log.debug("[DOWNLOAD] Calling RapidAPI conversion endpoint...")
 
         api_response = requests.get(
-            "https://robotilab.online/download-api/yt/audio?url=https://www.youtube.com/watch?v=phd1U2JIfUA",  # ← CHECK THIS URL matches what you see on the endpoint page
+            "https://youtube-mp310.p.rapidapi.com/download/mp3",
             headers={
-                "X-RapidAPI-Key":  RAPIDAPI_KEY,
-                "X-RapidAPI-Host": "youtube-mp310.p.rapidapi.com"
+                "x-rapidapi-key":  RAPIDAPI_KEY,
+                "x-rapidapi-host": "youtube-mp310.p.rapidapi.com"
             },
             params={
-                "url": downloadUrl   # ← CHECK THIS param name matches the endpoint page
+                "url": youtube_url
             },
             timeout=60
         )
@@ -153,17 +153,10 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
         log.debug(f"[DOWNLOAD] RapidAPI parsed response: {data}")
 
         # ── Step 2: Extract the MP3 download link from the response ──
-        # Common field names used by YouTube MP3 APIs — we try them all
-        mp3_url = (
-            data.get('link') or
-            data.get('url') or
-            data.get('download_url') or
-            data.get('mp3') or
-            data.get('downloadUrl')
-        )
+        mp3_url = data.get('downloadUrl')
 
         if not mp3_url:
-            raise Exception(f"Could not find MP3 link in API response. Full response: {data}")
+            raise Exception(f"No downloadUrl in response: {data}")
 
         log.info(f"[DOWNLOAD] Got MP3 URL from API: {mp3_url[:80]}...")
 
