@@ -2,4 +2,3 @@ flask
 twilio
 yt-dlp
 imageio-ffmpeg
-google-api-python-client
