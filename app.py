@@ -1,12 +1,13 @@
 import os
 import uuid
+import subprocess
 import threading
 import shutil
 import logging
-import requests
 from urllib.parse import quote
 from flask import Flask, request, send_from_directory
 from twilio.rest import Client
+import imageio_ffmpeg
 from googleapiclient.discovery import build
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -22,10 +23,11 @@ app = Flask(__name__)
 
 TWILIO_SID      = os.environ['TWILIO_ACCOUNT_SID']
 TWILIO_TOKEN    = os.environ['TWILIO_AUTH_TOKEN']
-PUBLIC_URL      = os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
+PUBLIC_URL      = os.environ['PUBLIC_URL'].rstrip('/')
 YOUTUBE_API_KEY = os.environ['YOUTUBE_API_KEY']
-RAPIDAPI_KEY    = os.environ['RAPIDAPI_KEY']
+FFMPEG_PATH     = imageio_ffmpeg.get_ffmpeg_exe()
 
+log.info(f"ffmpeg path resolved to: {FFMPEG_PATH}")
 log.info(f"PUBLIC_URL: {PUBLIC_URL}")
 
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
@@ -83,6 +85,7 @@ def search_youtube(query):
         return []
 
     video_ids = [item['id']['videoId'] for item in items]
+    log.debug(f"[SEARCH] Video IDs: {video_ids}")
 
     details_response = youtube.videos().list(
         id=','.join(video_ids),
@@ -119,69 +122,49 @@ def search_youtube(query):
 
 
 def download_and_send(youtube_url, title, uploader, from_number, to_number):
-    import time
-
     job_id  = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    log.info(f"[DOWNLOAD] Starting API download for: {youtube_url}")
+    log.info(f"[DOWNLOAD] Starting download: {youtube_url}")
 
     try:
-        # ── Step 1: Call RapidAPI to convert the YouTube URL to an MP3 link ──
-        log.debug("[DOWNLOAD] Calling RapidAPI conversion endpoint...")
+        output_template = os.path.join(job_dir, '%(title)s.%(ext)s')
 
-        api_response = requests.get(
-            "https://youtube-mp310.p.rapidapi.com/download/mp3",
-            headers={
-                "x-rapidapi-key":  RAPIDAPI_KEY,
-                "x-rapidapi-host": "youtube-mp310.p.rapidapi.com"
-            },
-            params={
-                "url": youtube_url
-            },
-            timeout=60
-        )
+        cmd = [
+            'yt-dlp',
+            youtube_url,
+            '--extract-audio',
+            '--audio-format', 'mp3',
+            '--audio-quality', '0',
+            '--output', output_template,
+            '--no-playlist',
+            '--ffmpeg-location', FFMPEG_PATH,
+            '--quiet'
+        ]
 
-        log.debug(f"[DOWNLOAD] RapidAPI status code: {api_response.status_code}")
-        log.debug(f"[DOWNLOAD] RapidAPI raw response: {api_response.text[:500]}")
+        log.debug(f"[DOWNLOAD] Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
 
-        if api_response.status_code != 200:
-            raise Exception(f"RapidAPI returned status {api_response.status_code}: {api_response.text}")
+        log.debug(f"[DOWNLOAD] yt-dlp return code: {result.returncode}")
+        if result.stderr:
+            log.warning(f"[DOWNLOAD] yt-dlp stderr: {result.stderr[:500]}")
 
-        data = api_response.json()
-        log.debug(f"[DOWNLOAD] RapidAPI parsed response: {data}")
+        mp3_files = [f for f in os.listdir(job_dir) if f.endswith('.mp3')]
 
-        # ── Step 2: Extract the MP3 download link from the response ──
-        mp3_url = data.get('downloadUrl')
+        if not mp3_files:
+            error_detail = result.stderr or result.stdout or 'Unknown error'
+            raise Exception(f"No MP3 created. yt-dlp said: {error_detail}")
 
-        if not mp3_url:
-            raise Exception(f"No downloadUrl in response: {data}")
-
-        log.info(f"[DOWNLOAD] Got MP3 URL from API: {mp3_url[:80]}...")
-
-        # ── Step 3: Download the MP3 to Render's disk ──
-        filename     = f"{job_id}.mp3"
-        filepath     = os.path.join(job_dir, filename)
-
-        log.debug("[DOWNLOAD] Downloading MP3 file to disk...")
-        mp3_response = requests.get(mp3_url, timeout=120)
-
-        if mp3_response.status_code != 200:
-            raise Exception(f"Failed to download MP3 file: status {mp3_response.status_code}")
-
-        with open(filepath, 'wb') as f:
-            f.write(mp3_response.content)
-
-        size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        log.info(f"[DOWNLOAD] MP3 saved to disk — size: {size_mb:.2f} MB")
+        filename = mp3_files[0]
+        size_mb  = os.path.getsize(os.path.join(job_dir, filename)) / (1024 * 1024)
+        log.info(f"[DOWNLOAD] MP3 ready — {filename} ({size_mb:.2f} MB)")
 
         if size_mb > 15:
             log.warning(f"[DOWNLOAD] File is {size_mb:.2f} MB — may exceed Twilio's 16MB limit")
 
-        # ── Step 4: Serve the file and send it via WhatsApp ──
-        file_url = f"{PUBLIC_URL}/files/{job_id}/{filename}"
-        log.info(f"[DOWNLOAD] Serving file at: {file_url}")
+        file_url = f"{PUBLIC_URL}/files/{job_id}/{quote(filename)}"
+        log.info(f"[DOWNLOAD] Serving at: {file_url}")
 
         send_message(
             from_number, to_number,
@@ -189,8 +172,8 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
             media_url=file_url
         )
 
-        # Clean up after 5 minutes
         def cleanup():
+            import time
             time.sleep(300)
             if os.path.exists(job_dir):
                 shutil.rmtree(job_dir)
@@ -203,7 +186,8 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
             shutil.rmtree(job_dir)
         send_message(
             from_number, to_number,
-            "❌ Download failed. Try a different result or search again."
+            "❌ Download failed. The video may be unavailable or too large. "
+            "Try a different result or search again."
         )
 
 
@@ -309,5 +293,5 @@ def index():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 3000))
+    port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
