@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 import subprocess
 import threading
 import shutil
@@ -8,7 +9,6 @@ from urllib.parse import quote
 from flask import Flask, request, send_from_directory
 from twilio.rest import Client
 import imageio_ffmpeg
-from googleapiclient.discovery import build
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -21,17 +21,15 @@ app = Flask(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TWILIO_SID      = os.environ['TWILIO_ACCOUNT_SID']
-TWILIO_TOKEN    = os.environ['TWILIO_AUTH_TOKEN']
-PUBLIC_URL      = os.environ['PUBLIC_URL'].rstrip('/')
-YOUTUBE_API_KEY = os.environ['YOUTUBE_API_KEY']
-FFMPEG_PATH     = imageio_ffmpeg.get_ffmpeg_exe()
+TWILIO_SID   = os.environ['TWILIO_ACCOUNT_SID']
+TWILIO_TOKEN = os.environ['TWILIO_AUTH_TOKEN']
+PUBLIC_URL   = os.environ['RENDER_EXTERNAL_URL'].rstrip('/')
+FFMPEG_PATH  = imageio_ffmpeg.get_ffmpeg_exe()
 
 log.info(f"ffmpeg path resolved to: {FFMPEG_PATH}")
 log.info(f"PUBLIC_URL: {PUBLIC_URL}")
 
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
-youtube       = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), 'downloads')
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -54,86 +52,93 @@ def send_message(to, from_, body, media_url=None):
     twilio_client.messages.create(**kwargs)
 
 
-def format_duration(iso_duration):
-    import re
-    if not iso_duration:
+def format_duration(seconds):
+    if not seconds:
         return '?:??'
-    match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_duration)
-    if not match:
-        return '?:??'
-    hours         = int(match.group(1) or 0)
-    minutes       = int(match.group(2) or 0)
-    seconds       = int(match.group(3) or 0)
-    total_minutes = hours * 60 + minutes
-    return f"{total_minutes}:{seconds:02d}"
+    seconds = int(float(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def search_youtube(query):
-    log.info(f"[SEARCH] Starting YouTube API search for: '{query}'")
+def search_soundcloud(query):
+    """
+    Use yt-dlp to search SoundCloud and return top 5 results.
+    SoundCloud does not block datacenter IPs so this works on Render.
+    """
+    log.info(f"[SEARCH] Starting SoundCloud search for: '{query}'")
 
-    search_response = youtube.search().list(
-        q=query,
-        part='id,snippet',
-        maxResults=5,
-        type='video'
-    ).execute()
+    cmd = [
+        'yt-dlp',
+        f'scsearch5:{query}',
+        '--dump-json',
+        '--no-download',
+        '--no-playlist',
+        '--quiet'
+    ]
 
-    items = search_response.get('items', [])
-    log.info(f"[SEARCH] YouTube API returned {len(items)} item(s)")
+    log.debug(f"[SEARCH] Running command: {' '.join(cmd)}")
 
-    if not items:
-        return []
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        log.error("[SEARCH] yt-dlp search timed out after 30 seconds")
+        raise Exception("Search timed out. Please try again.")
+    except FileNotFoundError:
+        log.error("[SEARCH] yt-dlp binary not found")
+        raise Exception("yt-dlp not installed correctly.")
 
-    video_ids = [item['id']['videoId'] for item in items]
-    log.debug(f"[SEARCH] Video IDs: {video_ids}")
+    log.debug(f"[SEARCH] yt-dlp return code: {result.returncode}")
 
-    details_response = youtube.videos().list(
-        id=','.join(video_ids),
-        part='contentDetails,snippet'
-    ).execute()
+    if result.stderr:
+        log.warning(f"[SEARCH] yt-dlp stderr: {result.stderr[:300]}")
 
-    details_map = {}
-    for video in details_response.get('items', []):
-        vid_id = video['id']
-        details_map[vid_id] = {
-            'duration': format_duration(video['contentDetails']['duration']),
-            'channel':  video['snippet']['channelTitle']
-        }
+    lines = result.stdout.strip().splitlines()
+    log.info(f"[SEARCH] yt-dlp returned {len(lines)} line(s)")
 
     results = []
-    for item in items:
-        vid_id   = item['id']['videoId']
-        title    = item['snippet']['title']
-        details  = details_map.get(vid_id, {})
-        channel  = details.get('channel', item['snippet']['channelTitle'])
-        duration = details.get('duration', '?:??')
-        url      = f"https://www.youtube.com/watch?v={vid_id}"
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            info  = json.loads(line)
+            title    = info.get('title', 'Unknown Title')
+            uploader = info.get('uploader', 'Unknown Artist')
+            duration = format_duration(info.get('duration'))
+            url      = info.get('webpage_url') or info.get('url', '')
 
-        log.debug(f"[SEARCH] Result: {title} — {channel} ({duration}) → {url}")
-        results.append({
-            'title':    title,
-            'uploader': channel,
-            'duration': duration,
-            'url':      url,
-        })
+            log.debug(f"[SEARCH] Result {i+1}: {title} — {uploader} ({duration})")
+            results.append({
+                'title':    title,
+                'uploader': uploader,
+                'duration': duration,
+                'url':      url,
+            })
+        except json.JSONDecodeError as e:
+            log.error(f"[SEARCH] Failed to parse JSON on line {i}: {e}")
+            continue
 
-    log.info(f"[SEARCH] Successfully built {len(results)} result(s)")
+    log.info(f"[SEARCH] Successfully parsed {len(results)} result(s)")
     return results
 
 
-def download_and_send(youtube_url, title, uploader, from_number, to_number):
+def download_and_send(track_url, title, uploader, from_number, to_number):
+    """Download a SoundCloud track as MP3 and send it to the user."""
     job_id  = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    log.info(f"[DOWNLOAD] Starting download: {youtube_url}")
+    log.info(f"[DOWNLOAD] Starting download: {track_url}")
 
     try:
         output_template = os.path.join(job_dir, '%(title)s.%(ext)s')
 
         cmd = [
             'yt-dlp',
-            youtube_url,
+            track_url,
             '--extract-audio',
             '--audio-format', 'mp3',
             '--audio-quality', '0',
@@ -181,12 +186,12 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
         threading.Thread(target=cleanup, daemon=True).start()
 
     except Exception as e:
-        log.error(f"[DOWNLOAD] Failed for {youtube_url}: {e}", exc_info=True)
+        log.error(f"[DOWNLOAD] Failed for {track_url}: {e}", exc_info=True)
         if os.path.exists(job_dir):
             shutil.rmtree(job_dir)
         send_message(
             from_number, to_number,
-            "❌ Download failed. The video may be unavailable or too large. "
+            "❌ Download failed. The track may be unavailable. "
             "Try a different result or search again."
         )
 
@@ -194,7 +199,7 @@ def download_and_send(youtube_url, title, uploader, from_number, to_number):
 def handle_new_search(query, from_number, to_number):
     log.info(f"[HANDLER] handle_new_search called — query='{query}' from={from_number}")
     try:
-        results = search_youtube(query)
+        results = search_soundcloud(query)
 
         if not results:
             log.warning(f"[HANDLER] Search returned 0 results for '{query}'")
@@ -207,7 +212,7 @@ def handle_new_search(query, from_number, to_number):
         user_sessions[from_number] = results
         log.info(f"[HANDLER] Session saved for {from_number} with {len(results)} result(s)")
 
-        lines = [f'🔍 Top YouTube results for "{query}":\n']
+        lines = [f'🔍 Top SoundCloud results for "{query}":\n']
         for i, r in enumerate(results, 1):
             lines.append(f"{i}. {r['title']} — {r['uploader']} ({r['duration']})")
         lines.append('\nReply with a number (1–5) to download, or send a new song name to search again.')
@@ -234,6 +239,7 @@ def webhook():
     if not body or not from_number:
         return '', 200
 
+    # ── Cancel ──────────────────────────────────────────────────────────────
     if body.lower() == 'cancel':
         if from_number in user_sessions:
             del user_sessions[from_number]
@@ -244,17 +250,19 @@ def webhook():
                 "Nothing to cancel! Send a song name to search.")
         return '', 200
 
-    if 'youtube.com/watch' in body or 'youtu.be/' in body:
+    # ── Direct SoundCloud URL ────────────────────────────────────────────────
+    if 'soundcloud.com/' in body:
         user_sessions.pop(from_number, None)
         send_message(from_number, to_number,
-            "⬇️ Got your YouTube link! Downloading now, please wait...")
+            "⬇️ Got your SoundCloud link! Downloading now, please wait...")
         threading.Thread(
             target=download_and_send,
-            args=(body, 'your song', 'YouTube', from_number, to_number),
+            args=(body, 'your track', 'SoundCloud', from_number, to_number),
             daemon=True
         ).start()
         return '', 200
 
+    # ── Number selection from previous search ────────────────────────────────
     if from_number in user_sessions and body in ('1', '2', '3', '4', '5'):
         idx     = int(body) - 1
         options = user_sessions[from_number]
@@ -278,6 +286,7 @@ def webhook():
 
         return '', 200
 
+    # ── New song search ──────────────────────────────────────────────────────
     user_sessions.pop(from_number, None)
     handle_new_search(body, from_number, to_number)
     return '', 200
@@ -293,5 +302,5 @@ def index():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
+    port = int(os.environ.get('PORT', 3000))
     app.run(host='0.0.0.0', port=port)
